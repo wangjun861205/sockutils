@@ -2,9 +2,11 @@ package sockutils
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 type _reader struct {
@@ -12,14 +14,16 @@ type _reader struct {
 	readChan  chan []byte
 	delimiter string
 	done      chan struct{}
+	timeout   time.Duration
 }
 
-func newReader(conn *net.TCPConn, delimiter string) *_reader {
+func newReader(conn *net.TCPConn, delimiter string, timeout time.Duration) *_reader {
 	reader := &_reader{
 		conn:      conn,
 		readChan:  make(chan []byte),
 		delimiter: delimiter,
 		done:      make(chan struct{}),
+		timeout:   timeout,
 	}
 	go reader.run()
 	return reader
@@ -34,6 +38,9 @@ func (r *_reader) run() {
 			close(r.readChan)
 			close(r.done)
 			return
+		}
+		if err := r.conn.SetReadDeadline(time.Now().Add(r.timeout)); err != nil {
+			continue
 		}
 		content = append(content, buf[:n]...)
 		if dataList := bytes.Split(content, []byte(r.delimiter)); len(dataList) > 1 {
@@ -91,10 +98,22 @@ type Connector struct {
 	argMap sync.Map
 }
 
-func NewConnector(conn *net.TCPConn, delimiter string) *Connector {
-	connector := &Connector{newReader(conn, delimiter), newWriter(conn, delimiter), make(chan struct{}), sync.Map{}}
+func NewConnector(conn *net.TCPConn, delimiter string, timeout time.Duration) (*Connector, error) {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if err := conn.SetNoDelay(true); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if err := conn.SetKeepAlive(true); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	connector := &Connector{newReader(conn, delimiter, timeout), newWriter(conn, delimiter), make(chan struct{}), sync.Map{}}
 	go connector.run()
-	return connector
+	return connector, nil
 }
 
 func (c *Connector) run() {
@@ -137,4 +156,96 @@ func (c *Connector) GetArg(key interface{}) (interface{}, bool) {
 
 func (c *Connector) SetArg(key interface{}, value interface{}) {
 	c.argMap.Store(key, value)
+}
+
+type TCPListener struct {
+	addr      string
+	delimiter string
+	timeout   time.Duration
+	connChan  chan *Connector
+	listener  *net.TCPListener
+	close     chan struct{}
+	done      chan struct{}
+}
+
+func NewTCPListener(addr, delimiter string, timeout time.Duration) (*TCPListener, error) {
+	netListener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	netTCPListener, ok := netListener.(*net.TCPListener)
+	if !ok {
+		return nil, errors.New("listener type assertion error")
+	}
+	l := &TCPListener{
+		addr:      addr,
+		delimiter: delimiter,
+		timeout:   timeout,
+		connChan:  make(chan *Connector),
+		listener:  netTCPListener,
+		close:     make(chan struct{}),
+		done:      make(chan struct{}),
+	}
+	go l.run()
+	return l, nil
+}
+
+func (l *TCPListener) run() {
+	for {
+		select {
+		case <-l.close:
+			close(l.connChan)
+			close(l.done)
+			fmt.Println("TCPListener has closed")
+			return
+		default:
+			conn, err := l.listener.AcceptTCP()
+			if err != nil {
+				fmt.Println("TCPListener: " + err.Error())
+				continue
+			}
+			connector, err := NewConnector(conn, l.delimiter, l.timeout)
+			if err != nil {
+				continue
+			}
+			go func() {
+				defer func() {
+					err := recover()
+					if err != nil {
+						fmt.Println("TCPListener: " + err.(error).Error())
+					}
+				}()
+				l.connChan <- connector
+			}()
+		}
+	}
+}
+
+func (l *TCPListener) Close() {
+	close(l.close)
+	l.listener.Close()
+}
+
+func (l *TCPListener) ConnChan() chan *Connector {
+	return l.connChan
+}
+
+func (l *TCPListener) Done() chan struct{} {
+	return l.done
+}
+
+func Dial(addr, delimiter string, timeout time.Duration) (*Connector, error) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return nil, errors.New("sockutils.Dial(): tcp connect type assert error")
+	}
+	connector, err := NewConnector(tcpConn, delimiter, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return connector, nil
 }

@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestConnector(t *testing.T) {
@@ -23,7 +24,11 @@ func TestConnector(t *testing.T) {
 			}
 			tcpConn := conn.(*net.TCPConn)
 			tcpConn.SetNoDelay(true)
-			connector := NewConnector(tcpConn, "\r\n\r\n")
+			connector, err := NewConnector(tcpConn, "\r\n\r\n", 10*time.Second)
+			if err != nil {
+				fmt.Println(err)
+				continue
+			}
 			go func() {
 				connChan <- connector
 			}()
@@ -54,7 +59,10 @@ func TestConnector(t *testing.T) {
 	}
 	tcpConn := conn.(*net.TCPConn)
 	tcpConn.SetNoDelay(true)
-	connector := NewConnector(tcpConn, "\r\n\r\n")
+	connector, err := NewConnector(tcpConn, "\r\n\r\n", 10*time.Second)
+	if err != nil {
+		log.Fatal(err)
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < 100000; i++ {
 		wg.Add(1)
